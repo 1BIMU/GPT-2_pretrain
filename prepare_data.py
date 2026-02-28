@@ -159,7 +159,7 @@ def process_huggingface_openwebtext(
     os.makedirs(output_dir, exist_ok=True)
 
     print("Loading OpenWebText from Hugging Face...")
-    dataset = load_dataset("openwebtext", trust_remote_code=True)
+    dataset = load_dataset("openwebtext")
 
     # 加载tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_name)
@@ -193,13 +193,15 @@ def process_huggingface_openwebtext(
         "test": split2["test"]
     }
 
-    # 保存为二进制文件（直接用PyArrow原生操作展平，零Python循环）
+    # 保存为二进制文件（逐chunk用PyArrow原生展平，避免offset溢出）
     for split_name, split_data in splits.items():
         print(f"Processing {split_name} ({len(split_data):,} documents)...")
-        # 直接访问底层Arrow table，用C++级别的ListArray.values展平
         token_column = split_data.data.column("tokens")
-        flat_values = token_column.combine_chunks().values
-        arr = flat_values.to_numpy().astype(np.uint16)
+        # 逐chunk展平：每个chunk内用C++级ListArray.values，绕过combine_chunks的int32 offset上限
+        chunk_arrays = []
+        for chunk in token_column.chunks:
+            chunk_arrays.append(chunk.values.to_numpy().astype(np.uint16))
+        arr = np.concatenate(chunk_arrays)
 
         output_file = os.path.join(output_dir, f"{split_name}.bin")
         arr.tofile(output_file)
