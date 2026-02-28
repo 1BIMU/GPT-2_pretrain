@@ -29,8 +29,8 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 # 配置参数（基于nanoGPT和OpenAI论文的最佳实践）
 #===============================================================================
 MODEL_SIZE=${MODEL_SIZE:-"gpt2-medium"}      # gpt2(124M), gpt2-medium(355M), gpt2-large(774M)
-DATA_DIR=${DATA_DIR:-"./data"}
-OUTPUT_BASE=${OUTPUT_BASE:-"./output"}
+DATA_DIR=${DATA_DIR:-"/outputs/wty/dataset"}
+OUTPUT_BASE=${OUTPUT_BASE:-"/outputs/wty/GPT2-output"}
 
 # 训练参数 (nanoGPT验证过的配置)
 BATCH_SIZE=${BATCH_SIZE:-12}                 # micro batch size per GPU
@@ -39,7 +39,7 @@ LEARNING_RATE=${LEARNING_RATE:-3e-4}         # peak learning rate
 MIN_LR=${MIN_LR:-3e-5}                       # minimum learning rate
 WARMUP_STEPS=${WARMUP_STEPS:-2000}           # warmup steps
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}            # weight decay (比0.01效果更好)
-NUM_EPOCHS=${NUM_EPOCHS:-1}
+NUM_EPOCHS=${NUM_EPOCHS:-10}
 MAX_STEPS=${MAX_STEPS:--1}                   # -1表示按epoch训练，完整训练建议600000
 
 # 数据划分
