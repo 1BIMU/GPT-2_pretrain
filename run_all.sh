@@ -35,10 +35,13 @@ OUTPUT_BASE=${OUTPUT_BASE:-"/outputs/wty/GPT2-output"}
 # 训练参数 (nanoGPT验证过的配置)
 BATCH_SIZE=${BATCH_SIZE:-12}                 # micro batch size per GPU
 GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION:-40}  # 有效batch = 12*40 = 480
-LEARNING_RATE=${LEARNING_RATE:-3e-4}         # peak learning rate
-MIN_LR=${MIN_LR:-3e-5}                       # minimum learning rate
+LEARNING_RATE=${LEARNING_RATE:-6e-4}         # peak learning rate (nanoGPT标准)
+MIN_LR=${MIN_LR:-6e-5}                       # minimum learning rate (peak的1/10)
 WARMUP_STEPS=${WARMUP_STEPS:-2000}           # warmup steps
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}            # weight decay (比0.01效果更好)
+ADAM_BETA1=${ADAM_BETA1:-0.9}                # Adam beta1
+ADAM_BETA2=${ADAM_BETA2:-0.95}               # Adam beta2 (比默认0.999更稳定)
+MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}          # 梯度裁剪
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 MAX_STEPS=${MAX_STEPS:--1}                   # -1表示按epoch训练，完整训练建议600000
 
@@ -65,8 +68,10 @@ echo "  Model:                ${MODEL_SIZE}"
 echo "  Batch size:           ${BATCH_SIZE} x ${GRADIENT_ACCUMULATION} = $((BATCH_SIZE * GRADIENT_ACCUMULATION))"
 echo "  Tokens per batch:     $((BATCH_SIZE * GRADIENT_ACCUMULATION * 1024))"
 echo "  Learning rate:        ${LEARNING_RATE} -> ${MIN_LR}"
+echo "  Adam betas:           (${ADAM_BETA1}, ${ADAM_BETA2})"
 echo "  Warmup steps:         ${WARMUP_STEPS}"
 echo "  Weight decay:         ${WEIGHT_DECAY}"
+echo "  Grad clip:            ${MAX_GRAD_NORM}"
 echo "  Epochs:               ${NUM_EPOCHS}"
 echo "  Data split:           train / val(${VAL_RATIO}) / test(${TEST_RATIO})"
 echo "  Output:               ${OUTPUT_BASE}"
@@ -79,7 +84,7 @@ log_info "Step 0: Checking environment..."
 
 # 检查Python
 if ! command -v python &> /dev/null; then
-    log_error "Python not found. Please install Python 3.8+."
+    log_error "Python not found. Please install Python 3.8+ and dependencies (pip install -r requirements.txt)."
     exit 1
 fi
 
@@ -91,10 +96,6 @@ if python -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; 
 else
     log_warn "No GPU detected. Training will be slow on CPU."
 fi
-
-# 安装依赖
-log_info "Installing dependencies..."
-pip install -q -r requirements.txt
 
 #===============================================================================
 # Step 1: 准备数据
@@ -158,6 +159,10 @@ else
         --gradient_accumulation ${GRADIENT_ACCUMULATION} \
         --learning_rate ${LEARNING_RATE} \
         --warmup_steps ${WARMUP_STEPS} \
+        --weight_decay ${WEIGHT_DECAY} \
+        --adam_beta1 ${ADAM_BETA1} \
+        --adam_beta2 ${ADAM_BETA2} \
+        --max_grad_norm ${MAX_GRAD_NORM} \
         --logging_steps 100 \
         --save_steps 5000 \
         --eval_steps 1000 \
@@ -193,6 +198,10 @@ else
         --gradient_accumulation ${GRADIENT_ACCUMULATION} \
         --learning_rate ${LEARNING_RATE} \
         --warmup_steps ${WARMUP_STEPS} \
+        --weight_decay ${WEIGHT_DECAY} \
+        --adam_beta1 ${ADAM_BETA1} \
+        --adam_beta2 ${ADAM_BETA2} \
+        --max_grad_norm ${MAX_GRAD_NORM} \
         --logging_steps 100 \
         --save_steps 5000 \
         --eval_steps 1000 \

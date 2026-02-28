@@ -163,6 +163,8 @@ def process_huggingface_openwebtext(
 
     # 加载tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_name)
+    # 我们会自行按block_size切块，这里不需要长度警告
+    tokenizer.model_max_length = int(1e30)
 
     def tokenize_function(examples):
         return {"tokens": [tokenizer.encode(text) for text in examples["text"]]}
@@ -191,17 +193,17 @@ def process_huggingface_openwebtext(
         "test": split2["test"]
     }
 
-    # 保存为二进制文件
+    # 保存为二进制文件（直接用PyArrow原生操作展平，零Python循环）
     for split_name, split_data in splits.items():
-        print(f"Processing {split_name}...")
-        all_tokens = []
-        for item in tqdm(split_data, desc=f"Collecting {split_name} tokens"):
-            all_tokens.extend(item["tokens"])
+        print(f"Processing {split_name} ({len(split_data):,} documents)...")
+        # 直接访问底层Arrow table，用C++级别的ListArray.values展平
+        token_column = split_data.data.column("tokens")
+        flat_values = token_column.combine_chunks().values
+        arr = flat_values.to_numpy().astype(np.uint16)
 
-        arr = np.array(all_tokens, dtype=np.uint16)
         output_file = os.path.join(output_dir, f"{split_name}.bin")
         arr.tofile(output_file)
-        print(f"Saved {len(all_tokens):,} tokens to {output_file}")
+        print(f"Saved {len(arr):,} tokens to {output_file}")
 
     print("Done!")
 

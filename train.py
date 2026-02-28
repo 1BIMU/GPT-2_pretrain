@@ -102,6 +102,8 @@ def train(config):
         # 优化器
         learning_rate=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
+        adam_beta1=config.training.adam_beta1,
+        adam_beta2=config.training.adam_beta2,
         warmup_steps=config.training.warmup_steps,
         max_grad_norm=config.training.max_grad_norm,
         lr_scheduler_type=config.training.lr_scheduler_type,
@@ -113,7 +115,7 @@ def train(config):
 
         # 保存
         save_steps=config.training.save_steps,
-        save_total_limit=3,
+        save_total_limit=5,
 
         # 评估
         eval_strategy="steps",
@@ -192,6 +194,9 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.95)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=5000)
@@ -225,6 +230,9 @@ def main():
     config.training.learning_rate = args.learning_rate
     config.training.warmup_steps = args.warmup_steps
     config.training.weight_decay = args.weight_decay
+    config.training.adam_beta1 = args.adam_beta1
+    config.training.adam_beta2 = args.adam_beta2
+    config.training.max_grad_norm = args.max_grad_norm
     config.training.logging_steps = args.logging_steps
     config.training.save_steps = args.save_steps
     config.training.eval_steps = args.eval_steps
