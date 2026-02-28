@@ -9,6 +9,9 @@
 # 4. 在test集上计算PPL
 # 5. 运行零样本下游任务评估
 # 6. 生成对比报告
+#
+# 多卡支持：自动检测GPU数量，多卡时用torchrun启动DDP训练
+# 可通过 NUM_GPUS=N 环境变量手动指定GPU数量
 #===============================================================================
 
 set -e
@@ -34,7 +37,6 @@ OUTPUT_BASE=${OUTPUT_BASE:-"/outputs/wty/GPT2-output"}
 
 # 训练参数 (nanoGPT验证过的配置)
 BATCH_SIZE=${BATCH_SIZE:-12}                 # micro batch size per GPU
-GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION:-40}  # 有效batch = 12*40 = 480
 LEARNING_RATE=${LEARNING_RATE:-6e-4}         # peak learning rate (nanoGPT标准)
 MIN_LR=${MIN_LR:-6e-5}                       # minimum learning rate (peak的1/10)
 WARMUP_STEPS=${WARMUP_STEPS:-2000}           # warmup steps
@@ -56,28 +58,6 @@ EVAL_TASKS=${EVAL_TASKS:-"lambada_openai,hellaswag,piqa,winogrande,arc_easy,arc_
 RESULTS_FILE="${OUTPUT_BASE}/comparison_results.txt"
 
 #===============================================================================
-# 打印配置
-#===============================================================================
-echo ""
-echo "╔══════════════════════════════════════════════════════════════════╗"
-echo "║          GPT-2 Dropout Comparison Experiment                     ║"
-echo "╚══════════════════════════════════════════════════════════════════╝"
-echo ""
-log_info "Configuration:"
-echo "  Model:                ${MODEL_SIZE}"
-echo "  Batch size:           ${BATCH_SIZE} x ${GRADIENT_ACCUMULATION} = $((BATCH_SIZE * GRADIENT_ACCUMULATION))"
-echo "  Tokens per batch:     $((BATCH_SIZE * GRADIENT_ACCUMULATION * 1024))"
-echo "  Learning rate:        ${LEARNING_RATE} -> ${MIN_LR}"
-echo "  Adam betas:           (${ADAM_BETA1}, ${ADAM_BETA2})"
-echo "  Warmup steps:         ${WARMUP_STEPS}"
-echo "  Weight decay:         ${WEIGHT_DECAY}"
-echo "  Grad clip:            ${MAX_GRAD_NORM}"
-echo "  Epochs:               ${NUM_EPOCHS}"
-echo "  Data split:           train / val(${VAL_RATIO}) / test(${TEST_RATIO})"
-echo "  Output:               ${OUTPUT_BASE}"
-echo ""
-
-#===============================================================================
 # Step 0: 检查环境
 #===============================================================================
 log_info "Step 0: Checking environment..."
@@ -90,12 +70,57 @@ fi
 
 # 检查GPU
 if python -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; then
+    NUM_GPUS=${NUM_GPUS:-$(python -c "import torch; print(torch.cuda.device_count())")}
     GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
     GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB')")
-    log_success "GPU detected: ${GPU_NAME} (${GPU_MEM})"
+    log_success "GPU detected: ${NUM_GPUS}x ${GPU_NAME} (${GPU_MEM})"
 else
+    NUM_GPUS=0
     log_warn "No GPU detected. Training will be slow on CPU."
 fi
+
+# 根据GPU数量自动调整gradient accumulation，保持有效batch size ≈ 480
+TARGET_EFFECTIVE_BATCH=480
+if [ "${NUM_GPUS}" -gt 0 ]; then
+    GRADIENT_ACCUMULATION=$((TARGET_EFFECTIVE_BATCH / (BATCH_SIZE * NUM_GPUS)))
+    if [ "${GRADIENT_ACCUMULATION}" -lt 1 ]; then
+        GRADIENT_ACCUMULATION=1
+    fi
+else
+    GRADIENT_ACCUMULATION=40
+fi
+EFFECTIVE_BATCH=$((BATCH_SIZE * GRADIENT_ACCUMULATION * (NUM_GPUS > 0 ? NUM_GPUS : 1)))
+
+# 训练启动命令：多卡用torchrun，单卡用python
+if [ "${NUM_GPUS}" -gt 1 ]; then
+    LAUNCH_CMD="torchrun --nproc_per_node=${NUM_GPUS}"
+else
+    LAUNCH_CMD="python"
+fi
+
+#===============================================================================
+# 打印配置
+#===============================================================================
+echo ""
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║          GPT-2 Dropout Comparison Experiment                     ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo ""
+log_info "Configuration:"
+echo "  Model:                ${MODEL_SIZE}"
+echo "  GPUs:                 ${NUM_GPUS}"
+echo "  Launch:               ${LAUNCH_CMD}"
+echo "  Batch size:           ${BATCH_SIZE} x ${GRADIENT_ACCUMULATION} x ${NUM_GPUS}gpu = ${EFFECTIVE_BATCH}"
+echo "  Tokens per batch:     $((EFFECTIVE_BATCH * 1024))"
+echo "  Learning rate:        ${LEARNING_RATE} -> ${MIN_LR}"
+echo "  Adam betas:           (${ADAM_BETA1}, ${ADAM_BETA2})"
+echo "  Warmup steps:         ${WARMUP_STEPS}"
+echo "  Weight decay:         ${WEIGHT_DECAY}"
+echo "  Grad clip:            ${MAX_GRAD_NORM}"
+echo "  Epochs:               ${NUM_EPOCHS}"
+echo "  Data split:           train / val(${VAL_RATIO}) / test(${TEST_RATIO})"
+echo "  Output:               ${OUTPUT_BASE}"
+echo ""
 
 #===============================================================================
 # Step 1: 准备数据
@@ -145,7 +170,7 @@ OUTPUT_DROPOUT="${OUTPUT_BASE}/gpt2-dropout-0.1"
 if [ -d "${OUTPUT_DROPOUT}/final" ]; then
     log_warn "Model already exists at ${OUTPUT_DROPOUT}/final, skipping training."
 else
-    python train.py \
+    ${LAUNCH_CMD} train.py \
         --model_size ${MODEL_SIZE} \
         --dropout 0.1 \
         --from_scratch \
@@ -184,7 +209,7 @@ OUTPUT_NO_DROPOUT="${OUTPUT_BASE}/gpt2-dropout-0.0"
 if [ -d "${OUTPUT_NO_DROPOUT}/final" ]; then
     log_warn "Model already exists at ${OUTPUT_NO_DROPOUT}/final, skipping training."
 else
-    python train.py \
+    ${LAUNCH_CMD} train.py \
         --model_size ${MODEL_SIZE} \
         --dropout 0.0 \
         --from_scratch \

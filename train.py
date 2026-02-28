@@ -88,7 +88,6 @@ def train(config):
     # 训练参数
     training_args = TrainingArguments(
         output_dir=config.training.output_dir,
-        overwrite_output_dir=True,
 
         # 训练轮数
         num_train_epochs=config.training.num_train_epochs,

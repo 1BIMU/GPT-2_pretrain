@@ -196,6 +196,8 @@ def process_huggingface_openwebtext(
     # 保存为二进制文件（逐chunk用PyArrow原生展平，避免offset溢出）
     for split_name, split_data in splits.items():
         print(f"Processing {split_name} ({len(split_data):,} documents)...")
+        # flatten_indices() 物化索引映射，否则.data返回的是完整原始表
+        split_data = split_data.flatten_indices()
         token_column = split_data.data.column("tokens")
         # 逐chunk展平：每个chunk内用C++级ListArray.values，绕过combine_chunks的int32 offset上限
         chunk_arrays = []
