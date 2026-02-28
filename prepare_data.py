@@ -178,36 +178,38 @@ def process_huggingface_openwebtext(
         desc="Tokenizing"
     )
 
-    # 划分训练集、验证集和测试集
-    # 先分出 test，再从剩余中分出 val
-    total_held_out = val_ratio + test_ratio
-    split1 = tokenized["train"].train_test_split(test_size=total_held_out, seed=42)
+    # 划分并保存：单次顺序遍历原始数据集，按随机标签分流到train/val/test
+    # 避免train_test_split产生的索引映射导致随机I/O
+    n = len(tokenized["train"])
+    print(f"Total documents: {n:,}")
 
-    # 从 held_out 中分出 val 和 test
-    val_test_ratio = test_ratio / total_held_out
-    split2 = split1["test"].train_test_split(test_size=val_test_ratio, seed=42)
+    # 生成每个文档的split分配：0=train, 1=val, 2=test
+    rng = np.random.RandomState(42)
+    assignments = np.zeros(n, dtype=np.uint8)
+    perm = rng.permutation(n)
+    test_size = int(n * test_ratio)
+    val_size = int(n * val_ratio)
+    assignments[perm[:test_size]] = 2
+    assignments[perm[test_size:test_size + val_size]] = 1
 
-    splits = {
-        "train": split1["train"],
-        "val": split2["train"],
-        "test": split2["test"]
-    }
+    split_arrays = {"train": [], "val": [], "test": []}
+    split_map = {0: "train", 1: "val", 2: "test"}
 
-    # 保存为二进制文件（批量切片读取，避免flatten_indices的全表复制）
-    for split_name, split_data in splits.items():
-        n = len(split_data)
-        print(f"Processing {split_name} ({n:,} documents)...")
-        chunk_arrays = []
-        batch_size = 50000
-        for i in tqdm(range(0, n, batch_size), desc=f"Collecting {split_name} tokens"):
-            batch_tokens = split_data[i:i+batch_size]["tokens"]
-            for tokens in batch_tokens:
-                chunk_arrays.append(np.array(tokens, dtype=np.uint16))
-        arr = np.concatenate(chunk_arrays)
+    full_data = tokenized["train"]
+    batch_size = 50000
+    for i in tqdm(range(0, n, batch_size), desc="Collecting tokens"):
+        end = min(i + batch_size, n)
+        batch_tokens = full_data[i:end]["tokens"]
+        batch_assignments = assignments[i:end]
+        for j, tokens in enumerate(batch_tokens):
+            split_name = split_map[batch_assignments[j]]
+            split_arrays[split_name].append(np.array(tokens, dtype=np.uint16))
 
+    for split_name, arrays in split_arrays.items():
+        arr = np.concatenate(arrays)
         output_file = os.path.join(output_dir, f"{split_name}.bin")
         arr.tofile(output_file)
-        print(f"Saved {len(arr):,} tokens to {output_file}")
+        print(f"Saved {split_name}: {len(arr):,} tokens to {output_file}")
 
     print("Done!")
 
