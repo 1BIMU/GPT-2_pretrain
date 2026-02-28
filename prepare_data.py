@@ -193,16 +193,16 @@ def process_huggingface_openwebtext(
         "test": split2["test"]
     }
 
-    # 保存为二进制文件（逐chunk用PyArrow原生展平，避免offset溢出）
+    # 保存为二进制文件（批量切片读取，避免flatten_indices的全表复制）
     for split_name, split_data in splits.items():
-        print(f"Processing {split_name} ({len(split_data):,} documents)...")
-        # flatten_indices() 物化索引映射，否则.data返回的是完整原始表
-        split_data = split_data.flatten_indices()
-        token_column = split_data.data.column("tokens")
-        # 逐chunk展平：每个chunk内用C++级ListArray.values，绕过combine_chunks的int32 offset上限
+        n = len(split_data)
+        print(f"Processing {split_name} ({n:,} documents)...")
         chunk_arrays = []
-        for chunk in token_column.chunks:
-            chunk_arrays.append(chunk.values.to_numpy().astype(np.uint16))
+        batch_size = 50000
+        for i in tqdm(range(0, n, batch_size), desc=f"Collecting {split_name} tokens"):
+            batch_tokens = split_data[i:i+batch_size]["tokens"]
+            for tokens in batch_tokens:
+                chunk_arrays.append(np.array(tokens, dtype=np.uint16))
         arr = np.concatenate(chunk_arrays)
 
         output_file = os.path.join(output_dir, f"{split_name}.bin")
