@@ -1,0 +1,25 @@
+# GPT-2 预训练环境依赖
+
+# PyTorch (根据你的CUDA版本选择)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Hugging Face
+transformers>=4.30.0
+datasets>=2.12.0
+tokenizers>=0.13.0
+accelerate>=0.20.0
+
+# 评估工具
+lm-eval>=0.4.0
+
+# 训练工具
+tensorboard>=2.13.0
+wandb>=0.15.0
+
+# 数据处理
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# 其他
+psutil>=5.9.0
