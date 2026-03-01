@@ -38,7 +38,7 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}            # weight decay (比0.01效果更好
 ADAM_BETA1=${ADAM_BETA1:-0.9}                # Adam beta1
 ADAM_BETA2=${ADAM_BETA2:-0.95}               # Adam beta2 (比默认0.999更稳定)
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}          # 梯度裁剪
-NUM_EPOCHS=${NUM_EPOCHS:-1}                  # 训练轮数（OpenWebText建议1-2 epoch）
+NUM_EPOCHS=${NUM_EPOCHS:-10}
 MAX_STEPS=${MAX_STEPS:--1}                   # -1表示按epoch训练，完整训练建议600000
 
 DROPOUT=0.0                                   # Dropout率
