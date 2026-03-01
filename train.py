@@ -60,25 +60,26 @@ def train(config):
     # 创建输出目录
     os.makedirs(config.training.output_dir, exist_ok=True)
 
-    # 初始化 SwanLab
-    swanlab_run = swanlab.init(
-        project="GPT2-Dropout-Comparison",
-        experiment_name=f"gpt2-dropout-{config.model.resid_pdrop}",
-        config={
-            "model_size": config.model.model_size,
-            "dropout": config.model.resid_pdrop,
-            "learning_rate": config.training.learning_rate,
-            "batch_size": config.training.per_device_train_batch_size,
-            "gradient_accumulation": config.training.gradient_accumulation_steps,
-            "warmup_steps": config.training.warmup_steps,
-            "weight_decay": config.training.weight_decay,
-            "adam_beta1": config.training.adam_beta1,
-            "adam_beta2": config.training.adam_beta2,
-            "max_grad_norm": config.training.max_grad_norm,
-            "num_epochs": config.training.num_train_epochs,
-            "block_size": config.data.block_size,
-        },
-    )
+    # 初始化 SwanLab（仅在主进程）
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        swanlab_run = swanlab.init(
+            project="GPT2-Dropout-Comparison",
+            experiment_name=f"gpt2-dropout-{config.model.resid_pdrop}",
+            config={
+                "model_size": config.model.model_size,
+                "dropout": config.model.resid_pdrop,
+                "learning_rate": config.training.learning_rate,
+                "batch_size": config.training.per_device_train_batch_size,
+                "gradient_accumulation": config.training.gradient_accumulation_steps,
+                "warmup_steps": config.training.warmup_steps,
+                "weight_decay": config.training.weight_decay,
+                "adam_beta1": config.training.adam_beta1,
+                "adam_beta2": config.training.adam_beta2,
+                "max_grad_norm": config.training.max_grad_norm,
+                "num_epochs": config.training.num_train_epochs,
+                "block_size": config.data.block_size,
+            },
+        )
 
     # 创建模型
     model, model_config = create_model(
@@ -190,14 +191,14 @@ def train(config):
     final_ppl = torch.exp(torch.tensor(eval_results['eval_loss'])).item()
     print(f"Final perplexity: {final_ppl:.2f}")
 
-    # 记录最终指标到 SwanLab
-    swanlab.log({
-        "final/eval_loss": eval_results['eval_loss'],
-        "final/perplexity": final_ppl,
-    })
-
-    # 结束 SwanLab 实验
-    swanlab.finish()
+    # 记录最终指标到 SwanLab（仅在主进程）
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        swanlab.log({
+            "final/eval_loss": eval_results['eval_loss'],
+            "final/perplexity": final_ppl,
+        })
+        # 结束 SwanLab 实验
+        swanlab.finish()
 
     return trainer
 
