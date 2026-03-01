@@ -6,6 +6,7 @@ import os
 import argparse
 import torch
 import wandb
+import swanlab
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -58,6 +59,26 @@ def train(config):
 
     # 创建输出目录
     os.makedirs(config.training.output_dir, exist_ok=True)
+
+    # 初始化 SwanLab
+    swanlab_run = swanlab.init(
+        project="GPT2-Dropout-Comparison",
+        experiment_name=f"gpt2-dropout-{config.model.resid_pdrop}",
+        config={
+            "model_size": config.model.model_size,
+            "dropout": config.model.resid_pdrop,
+            "learning_rate": config.training.learning_rate,
+            "batch_size": config.training.per_device_train_batch_size,
+            "gradient_accumulation": config.training.gradient_accumulation_steps,
+            "warmup_steps": config.training.warmup_steps,
+            "weight_decay": config.training.weight_decay,
+            "adam_beta1": config.training.adam_beta1,
+            "adam_beta2": config.training.adam_beta2,
+            "max_grad_norm": config.training.max_grad_norm,
+            "num_epochs": config.training.num_train_epochs,
+            "block_size": config.data.block_size,
+        },
+    )
 
     # 创建模型
     model, model_config = create_model(
@@ -131,9 +152,10 @@ def train(config):
         seed=config.training.seed,
         dataloader_num_workers=config.training.dataloader_num_workers,
         dataloader_pin_memory=True,
+        ddp_find_unused_parameters=False,
 
         # 报告
-        report_to=["tensorboard"],
+        report_to=["tensorboard", "swanlab"],
 
         # 断点续训
         resume_from_checkpoint=config.training.resume_from_checkpoint,
@@ -165,7 +187,17 @@ def train(config):
     print("\nFinal evaluation...")
     eval_results = trainer.evaluate()
     print(f"Final eval loss: {eval_results['eval_loss']:.4f}")
-    print(f"Final perplexity: {torch.exp(torch.tensor(eval_results['eval_loss'])).item():.2f}")
+    final_ppl = torch.exp(torch.tensor(eval_results['eval_loss'])).item()
+    print(f"Final perplexity: {final_ppl:.2f}")
+
+    # 记录最终指标到 SwanLab
+    swanlab.log({
+        "final/eval_loss": eval_results['eval_loss'],
+        "final/perplexity": final_ppl,
+    })
+
+    # 结束 SwanLab 实验
+    swanlab.finish()
 
     return trainer
 
