@@ -436,7 +436,8 @@ def compute_gen_loss(model, task_loss, config):
 
     # Generator 目标: 最大化 task_loss，最小化 cost，最大化 entropy
     # cost 使用 total（所有层之和），与 CLIP 参考实现一致
+    avg_cost = total_cost / count
     w = config.get('task_loss_weight', 0.2)
-    gen_loss = -w * task_loss + total_cost - (config['entropy_weight'] * avg_entropy)
+    gen_loss = -w * task_loss + avg_cost - (config['entropy_weight'] * avg_entropy)
 
-    return gen_loss, (total_cost / count).item()
+    return gen_loss, avg_cost.item()
