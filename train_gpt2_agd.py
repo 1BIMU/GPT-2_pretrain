@@ -449,10 +449,9 @@ def main():
 
         # ==========================================
         # Phase A: Attack (仅 AGD 模式)
-        # 🚨 修复：只有在梯度真正同步时才更新 Generator，实现公平对决
         # ==========================================
         cost_val = 0.0
-        if CONFIG['mode'] == 'agd' and accelerator.sync_gradients:
+        if CONFIG['mode'] == 'agd':
             # 冻结模型，只训练 Generator
             for p in model_params:
                 p.requires_grad = False
