@@ -254,7 +254,7 @@ def main():
     # === 初始化 SwanLab ===
     if accelerator.is_main_process and HAS_SWANLAB:
         swanlab.init(
-            project="GPT2-AGD",
+            project="GPT2-Dropout-Comparison",
             experiment_name=f"{CONFIG['model_size']}-{CONFIG['mode']}",
             config=CONFIG,
         )
@@ -343,15 +343,19 @@ def main():
     )
 
     # === 自动计算 max_steps (如果传了 -1) ===
+    # 先计算 steps_per_epoch（即使不是-1也要计算，用于epoch追踪）
+    samples_per_epoch = len(train_dataset)
+    batches_per_epoch = math.ceil(samples_per_epoch / (CONFIG['batch_size'] * accelerator.num_processes))
+    steps_per_epoch = math.ceil(batches_per_epoch / CONFIG['grad_accum'])
+    
     if CONFIG['max_steps'] <= 0:
-        # steps_per_epoch = ceil(dataset_samples / (batch_size * num_gpus)) / grad_accum
-        samples_per_epoch = len(train_dataset)
-        batches_per_epoch = math.ceil(samples_per_epoch / (CONFIG['batch_size'] * accelerator.num_processes))
-        steps_per_epoch = math.ceil(batches_per_epoch / CONFIG['grad_accum'])
         CONFIG['max_steps'] = steps_per_epoch * CONFIG['num_epochs']
         if accelerator.is_main_process:
             print(f"📊 自动计算 max_steps: {samples_per_epoch:,} samples × {CONFIG['num_epochs']} epochs")
             print(f"   = {steps_per_epoch:,} steps/epoch × {CONFIG['num_epochs']} epochs = {CONFIG['max_steps']:,} total steps")
+    
+    if accelerator.is_main_process:
+        print(f"📊 Steps per epoch: {steps_per_epoch:,}")
 
     # === 优化器设置 ===
     model_params = list(model.parameters())
@@ -437,6 +441,7 @@ def main():
     ema_decay = 0.9
     last_gen_loss = 0.0  # 最近一次 gen_loss（用于日志）
     last_cost_val = 0.0  # 最近一次 cost（用于日志）
+    current_epoch = global_step // steps_per_epoch  # 当前 epoch
 
     # 创建无限循环的数据加载器
     from itertools import cycle
@@ -613,11 +618,15 @@ def main():
 
         # === SwanLab 日志 (必须在 stats 清空之前) ===
         if global_step % CONFIG['logging_steps'] == 0 and accelerator.is_main_process and HAS_SWANLAB:
+            # 计算当前epoch
+            current_epoch = global_step / steps_per_epoch
+            
             log_dict = {
                 "train/loss": loss_val,
                 "train/loss_ema": loss_ema if loss_ema is not None else loss_val,
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/step": global_step,
+                "train/epoch": current_epoch,
             }
 
             if CONFIG['mode'] == 'agd':
@@ -650,6 +659,12 @@ def main():
 
         global_step += 1
         progress_bar.update(1)
+        
+        # 更新 epoch（用于进度条显示）
+        new_epoch = global_step // steps_per_epoch
+        if new_epoch > current_epoch and accelerator.is_main_process:
+            current_epoch = new_epoch
+            print(f"\n📊 Epoch {current_epoch}/{CONFIG['num_epochs']} completed")
 
         # === 评估 ===
         if global_step % CONFIG['eval_steps'] == 0:
