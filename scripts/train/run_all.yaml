@@ -52,15 +52,16 @@ search:
         - export WANDB_PROJECT=wty_gpt2_pretrain
         - export DATA_DIR=/mnt/yixiali/CODES/WTY/GPT-2_pretrain/data
         - export OUTPUT_BASE=/mnt/yixiali/CODES/WTY/GPT-2_pretrain/output
-        - bash {SCRIPT}
+        - bash {SCRIPT} --resume
     type: grid
     max_trials: 500
     params:
         - name: SCRIPT
           spec: discrete
           values: [
-            "train_with_dropout.sh",
-            "train_without_dropout.sh",
+            # "train_with_dropout.sh",
+            # "train_without_dropout.sh",
+            "train_with_agd.sh",
             ]
 
 # amlt run scripts/train/run_all.yaml

@@ -6,4 +6,4 @@ export OUTPUT_BASE=/mnt/yixiali/CODES/WTY/GPT-2_pretrain/output
 
 # bash train_with_dropout.sh --resume
 # bash train_without_dropout.sh --resume
-bash train_with_agd.sh
+bash train_with_agd.sh --resume
