@@ -139,7 +139,7 @@ class AGDDropoutWrapper(nn.Module):
       D4: model.drop         (embedding 后)      → upstream: None (无权重先验)
     """
     def __init__(self, generator, layer_idx, config, upstream_linear=None,
-                 feature_dim=None, ema_decay=0.99, name=''):
+                 feature_dim=None, ema_decay=0.99, name='', target_p=0.1):
         super().__init__()
         self._gen_ref = [generator]
         self.layer_idx = layer_idx
@@ -152,6 +152,9 @@ class AGDDropoutWrapper(nn.Module):
         self.name = name  # 调试标识 (e.g. "L0.attn_dropout")
         self._grad_ema = None
         self._out_features = feature_dim
+        # 使用与 nn.Dropout(p=target_p) 相同的固定 scale factor
+        # 确保与 Random Dropout 基线的公平对比
+        self.scale_factor = 1.0 / (1.0 - target_p) if target_p < 1.0 else 1.0
 
     @property
     def grad_ema(self):
@@ -176,13 +179,19 @@ class AGDDropoutWrapper(nn.Module):
         return self._gen_ref[0]
 
     def update_grad_ema(self, grad):
-        """更新梯度 EMA"""
+        """更新梯度 EMA（带 NaN/Inf 保护）"""
         with torch.no_grad():
             if grad.dim() > 1:
                 grad = grad.abs().mean(dim=list(range(grad.dim() - 1)))
             else:
                 grad = grad.abs()
+            # 🛡️ 防止 NaN/Inf 梯度永久污染 grad_ema
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                return  # 跳过本次更新，保留上一次的健康值
             self.grad_ema = self.ema_decay * self.grad_ema + (1 - self.ema_decay) * grad
+            # 额外检查：如果 grad_ema 本身被污染，重置为零
+            if torch.isnan(self.grad_ema).any() or torch.isinf(self.grad_ema).any():
+                self.grad_ema = torch.zeros_like(self.grad_ema)
 
     def forward(self, x):
         """
@@ -218,13 +227,18 @@ class AGDDropoutWrapper(nn.Module):
             mean = inp_fp32.mean(dim=-1, keepdim=True)
             std = inp_fp32.std(dim=-1, keepdim=True)
             act_norm = (inp_fp32 - mean) / (std + 1e-5)
+            act_norm = torch.clamp(act_norm, -5.0, 5.0)  # 防止 std≈0 时爆炸
 
-            # 2. 梯度动量归一化
+            # 2. 梯度动量归一化（带 NaN 保护）
             with torch.no_grad():
                 g = self._get_grad_ema_on(inp_fp32.device).view(1, 1, -1).expand_as(inp_fp32)
+                # 🛡️ 如果 grad_ema 含 NaN/Inf，用零替代
+                if torch.isnan(g).any() or torch.isinf(g).any():
+                    g = torch.zeros_like(g)
                 g_mean = g.mean(dim=-1, keepdim=True)
                 g_std = g.std(dim=-1, keepdim=True)
                 g_norm = (g - g_mean) / (g_std + 1e-5)
+                g_norm = torch.clamp(g_norm, -5.0, 5.0)  # 防止爆炸
 
             # 3. 权重幅值归一化
             with torch.no_grad():
@@ -237,6 +251,7 @@ class AGDDropoutWrapper(nn.Module):
                 w_mean = w.mean(dim=-1, keepdim=True)
                 w_std = w.std(dim=-1, keepdim=True)
                 w_norm = (w - w_mean) / (w_std + 1e-5)
+                w_norm = torch.clamp(w_norm, -5.0, 5.0)  # 防止爆炸
 
             # 拼接状态: [激活, 梯度, 权重]
             state = torch.cat([act_norm, g_norm, w_norm], dim=-1)
@@ -255,11 +270,10 @@ class AGDDropoutWrapper(nn.Module):
             self.stats['probs'] = probs
             self.stats['logits'] = logits
 
-            # 缩放因子
-            keep_prob_actual = probs.mean().detach()
-            keep_prob_safe = torch.clamp(keep_prob_actual, min=0.1)
-            scale_factor = 1.0 / keep_prob_safe
-            scale_factor = torch.clamp(scale_factor, max=3.0)
+            # 使用固定 scale factor（与 nn.Dropout 的 inverted dropout 一致）
+            # 例如 target_p=0.1 → scale = 1/0.9 ≈ 1.1111
+            # 这保证了与 Random Dropout 的公平对比，且不会因动态 scale 导致深层累积放大
+            sf = self.scale_factor
 
             # 应用掩码（用原始 x 保留梯度）
             x_fp32 = x.float()
@@ -267,9 +281,9 @@ class AGDDropoutWrapper(nn.Module):
                 # D1: 恢复 4D 形状
                 batch, heads, seq_q, seq_k = original_shape
                 mask_4d = mask.reshape(batch, heads, seq_q, seq_k)
-                out_dropped = x_fp32 * mask_4d * scale_factor
+                out_dropped = x_fp32 * mask_4d * sf
             else:
-                out_dropped = x_fp32 * mask * scale_factor
+                out_dropped = x_fp32 * mask * sf
 
         return out_dropped.to(x.dtype)
 
@@ -292,11 +306,13 @@ def inject_dropout_to_gpt2(model, config):
     """
     将 AGD 或 Random Dropout 注入到 GPT-2 模型
 
-    完全对齐官方 GPT-2 的 4 个 dropout 位置:
-      D1: block.attn.attn_dropout   — 注意力权重 dropout     (attn_pdrop)
-      D2: block.attn.resid_dropout  — 注意力残差 dropout      (resid_pdrop)
-      D3: block.mlp.dropout         — MLP 残差 dropout         (resid_pdrop)
-      D4: model.transformer.drop    — Embedding dropout        (embd_pdrop)
+    AGD 与 Random Dropout 注入**完全相同的位置** (D2, D3, D4)，
+    确保实验对比的公平性。
+
+    使用固定 scale factor = 1/(1-p) 与 nn.Dropout 的 inverted dropout 一致，
+    避免动态 scale 在深层残差网络中累积放大。
+
+    D1 (attn_dropout) 因维度不固定 [batch, heads, seq, seq]，两种模式均跳过。
 
     Args:
         model: GPT2LMHeadModel
@@ -309,14 +325,12 @@ def inject_dropout_to_gpt2(model, config):
     blocks = model.transformer.h
     num_layers = len(blocks)
     mode = config.get('mode', 'agd')
+    dropout_p = config.get('dropout_p', 0.1)  # 用于 Random 和 AGD 的 scale factor
     generator = None
 
-    # 每个 block 有 3 个 dropout (D1, D2, D3)，加上 1 个 embedding dropout (D4)
-    # 总层数 = num_layers * 3 + 1
-    total_dropout_layers = num_layers * 3 + 1
+    # D2 + D3 + D4 = num_layers * 2 + 1
+    total_dropout_layers = num_layers * 2 + 1
     embed_dim = model.config.n_embd
-    n_head = model.config.n_head
-    head_dim = embed_dim // n_head
 
     if mode == 'agd':
         generator = SharedMaskGenerator(
@@ -325,12 +339,13 @@ def inject_dropout_to_gpt2(model, config):
         )
         print(f"🔥 Mode: AGD (Adversarial Gumbel-Dropout) 已激活")
         print(f"   - Transformer blocks: {num_layers}")
-        print(f"   - 每 block 3 个 dropout + 1 个 embedding dropout = {total_dropout_layers} 个 AGD 层")
+        print(f"   - 注入位置: D2 (attn_resid) + D3 (mlp) + D4 (embedding) = {total_dropout_layers} 个")
+        print(f"   - 固定 scale factor: 1/(1-{dropout_p}) = {1.0/(1.0-dropout_p):.4f} (与 nn.Dropout 对齐)")
         print(f"   - 特征维度: {embed_dim}")
     else:
         p = config.get('dropout_p', 0.1)
         print(f"🧊 Mode: Random Dropout (p={p}) 已激活")
-        print(f"   - 替换所有 {total_dropout_layers} 个 dropout 层")
+        print(f"   - 注入位置: D2 (attn_resid) + D3 (mlp) + D4 (embedding) = {total_dropout_layers} 个")
 
     layer_idx = 0
 
@@ -341,54 +356,46 @@ def inject_dropout_to_gpt2(model, config):
             upstream_linear=None,  # embedding 没有上游线性层
             feature_dim=embed_dim,
             name='embd_dropout',
+            target_p=dropout_p,
         )
+        layer_idx += 1
     else:
-        model.transformer.drop = RandomDropoutWrapper(p=config.get('dropout_p', 0.1))
-    layer_idx += 1
+        model.transformer.drop = RandomDropoutWrapper(p=dropout_p)
 
-    # === D1, D2, D3: 每个 block 内的 3 个 dropout ===
+    # === D1, D2, D3: 每个 block 内的 dropout ===
     for i, block in enumerate(blocks):
-        # D1: attn.attn_dropout — 注意力权重 dropout
-        # 上游: c_attn 投影，但 attn weights 的维度是 [batch, heads, seq, seq]
-        # 我们用 head_dim 作为特征维度不太合适，用 embed_dim 统一
-        # 注意: D1 的 feature_dim 与其他不同，但 generator 输出维度固定为 embed_dim
-        # 对于 attention weights [batch, heads, seq_q, seq_k]，seq_k 维度不固定
-        # → 跳过 D1，保留原始 nn.Dropout (与 CLIP 参考实现一致，CLIP 也只注入 MLP 和 resid)
-        # 原因: attn_dropout 作用于 [batch, heads, seq_q, seq_k] 的最后一维是 seq_len,
-        #        不是固定特征维度，无法用固定维度的 generator 生成掩码
+        # D1: attn.attn_dropout — 跳过（维度不固定）
+        # 两种模式下均保留原始 nn.Dropout(p=0.0)
 
-        # D2: attn.resid_dropout — 注意力残差 dropout
+        # D2: attn.resid_dropout
         if mode == 'agd':
             block.attn.resid_dropout = AGDDropoutWrapper(
                 generator=generator, layer_idx=layer_idx, config=config,
                 upstream_linear=block.attn.c_proj,
                 feature_dim=embed_dim,
                 name=f'L{i}.attn_resid_dropout',
+                target_p=dropout_p,
             )
+            layer_idx += 1
         else:
-            block.attn.resid_dropout = RandomDropoutWrapper(p=config.get('dropout_p', 0.1))
-        layer_idx += 1
+            block.attn.resid_dropout = RandomDropoutWrapper(p=dropout_p)
 
-        # D3: mlp.dropout — MLP 残差 dropout
+        # D3: mlp.dropout
         if mode == 'agd':
             block.mlp.dropout = AGDDropoutWrapper(
                 generator=generator, layer_idx=layer_idx, config=config,
                 upstream_linear=block.mlp.c_proj,
                 feature_dim=embed_dim,
                 name=f'L{i}.mlp_dropout',
+                target_p=dropout_p,
             )
+            layer_idx += 1
         else:
-            block.mlp.dropout = RandomDropoutWrapper(p=config.get('dropout_p', 0.1))
-        layer_idx += 1
+            block.mlp.dropout = RandomDropoutWrapper(p=dropout_p)
 
-        # D1 的 layer_idx 也要占位（即使不注入 AGD），保持 layer embedding 的对齐
-        # 如果以后想支持 D1，只需在这里改成 AGDDropoutWrapper
-        layer_idx += 1
-
-    actual_agd_count = layer_idx - num_layers  # 减去 D1 跳过的数量
     if mode == 'agd':
-        print(f"   - 实际注入 AGD: {actual_agd_count} 个 (跳过 {num_layers} 个 attn_dropout)")
-        print(f"   - D4 (embd): 1, D2 (attn_resid): {num_layers}, D3 (mlp): {num_layers}")
+        print(f"   - 实际注入 AGD: {layer_idx} 个")
+        print(f"     D4 (embd): 1, D2 (attn_resid): {num_layers}, D3 (mlp): {num_layers}")
     return model, generator
 
 
@@ -436,8 +443,7 @@ def compute_gen_loss(model, task_loss, config):
 
     # Generator 目标: 最大化 task_loss，最小化 cost，最大化 entropy
     # cost 使用 total（所有层之和），与 CLIP 参考实现一致
-    avg_cost = total_cost / count
     w = config.get('task_loss_weight', 0.2)
-    gen_loss = -w * task_loss + avg_cost - (config['entropy_weight'] * avg_entropy)
+    gen_loss = -w * task_loss + total_cost - (config['entropy_weight'] * avg_entropy)
 
-    return gen_loss, avg_cost.item()
+    return gen_loss, (total_cost / count).item()

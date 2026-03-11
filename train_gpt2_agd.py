@@ -39,12 +39,12 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='agd', choices=['agd', 'random'],
                         help='训练模式: agd 或 random')
     parser.add_argument('--dropout_p', type=float, default=0.1,
-                        help='Random Dropout 概率 (仅在 mode=random 时生效)')
+                        help='Dropout 概率 (Random 模式直接使用，AGD 模式用于固定 scale factor)')
 
     # 模型参数
     parser.add_argument('--model_size', type=str, default='gpt2-medium',
                         choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'])
-    parser.add_argument('--from_scratch', action='store_true', default=True,
+    parser.add_argument('--from_scratch', action='store_true', default=False,
                         help='是否从头训练（随机初始化）')
 
     # 训练参数
@@ -70,6 +70,18 @@ def parse_args():
     parser.add_argument('--adam_beta2', type=float, default=0.95)
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='梯度裁剪')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
+
+    # 混合精度
+    parser.add_argument('--fp16', action='store_true', default=False,
+                        help='使用 fp16 混合精度')
+    parser.add_argument('--bf16', action='store_true', default=True,
+                        help='使用 bf16 混合精度 (默认，与 train.py 对齐)')
+
+    # 梯度检查点
+    parser.add_argument('--gradient_checkpointing', action='store_true', default=False,
+                        help='是否启用梯度检查点 (省显存但降速)')
 
     # 数据参数
     parser.add_argument('--train_file', type=str, default='./data/train.bin')
@@ -129,6 +141,10 @@ def build_config(args):
         'adam_beta1': args.adam_beta1,
         'adam_beta2': args.adam_beta2,
         'max_grad_norm': args.max_grad_norm,
+        'seed': args.seed,
+        'fp16': args.fp16,
+        'bf16': args.bf16,
+        'gradient_checkpointing': args.gradient_checkpointing,
 
         # --- 数据参数 ---
         'train_file': args.train_file,
@@ -254,7 +270,7 @@ def main():
     # === 初始化 SwanLab ===
     if accelerator.is_main_process and HAS_SWANLAB:
         swanlab.init(
-            project="GPT2-Dropout-Comparison",
+            project="GPT2-AGD",
             experiment_name=f"{CONFIG['model_size']}-{CONFIG['mode']}",
             config=CONFIG,
         )
@@ -343,19 +359,15 @@ def main():
     )
 
     # === 自动计算 max_steps (如果传了 -1) ===
-    # 先计算 steps_per_epoch（即使不是-1也要计算，用于epoch追踪）
-    samples_per_epoch = len(train_dataset)
-    batches_per_epoch = math.ceil(samples_per_epoch / (CONFIG['batch_size'] * accelerator.num_processes))
-    steps_per_epoch = math.ceil(batches_per_epoch / CONFIG['grad_accum'])
-    
     if CONFIG['max_steps'] <= 0:
+        # steps_per_epoch = ceil(dataset_samples / (batch_size * num_gpus)) / grad_accum
+        samples_per_epoch = len(train_dataset)
+        batches_per_epoch = math.ceil(samples_per_epoch / (CONFIG['batch_size'] * accelerator.num_processes))
+        steps_per_epoch = math.ceil(batches_per_epoch / CONFIG['grad_accum'])
         CONFIG['max_steps'] = steps_per_epoch * CONFIG['num_epochs']
         if accelerator.is_main_process:
             print(f"📊 自动计算 max_steps: {samples_per_epoch:,} samples × {CONFIG['num_epochs']} epochs")
             print(f"   = {steps_per_epoch:,} steps/epoch × {CONFIG['num_epochs']} epochs = {CONFIG['max_steps']:,} total steps")
-    
-    if accelerator.is_main_process:
-        print(f"📊 Steps per epoch: {steps_per_epoch:,}")
 
     # === 优化器设置 ===
     model_params = list(model.parameters())
@@ -441,7 +453,6 @@ def main():
     ema_decay = 0.9
     last_gen_loss = 0.0  # 最近一次 gen_loss（用于日志）
     last_cost_val = 0.0  # 最近一次 cost（用于日志）
-    current_epoch = global_step // steps_per_epoch  # 当前 epoch
 
     # 创建无限循环的数据加载器
     from itertools import cycle
@@ -466,6 +477,12 @@ def main():
                     m.phase_a = True
 
             unwrapped = accelerator.unwrap_model(model)
+
+            # 🛡️ Phase A 禁用梯度检查点：避免 recompute 时 noisy_ste 随机噪声不一致
+            _gc_was_enabled = unwrapped.is_gradient_checkpointing if hasattr(unwrapped, 'is_gradient_checkpointing') else False
+            if _gc_was_enabled:
+                unwrapped.gradient_checkpointing_disable()
+
             for gs in range(CONFIG['gen_steps']):
                 opt_gen.zero_grad()
 
@@ -551,6 +568,10 @@ def main():
                 if isinstance(m, AGDDropoutWrapper):
                     m.phase_a = False
 
+            # 🛡️ Phase A 结束后恢复梯度检查点
+            if _gc_was_enabled:
+                unwrapped.gradient_checkpointing_enable()
+
             # 恢复 model_params 的 requires_grad
             for p in model_params:
                 p.requires_grad = True
@@ -569,64 +590,74 @@ def main():
             outputs = model(**batch)
             loss_model = outputs.loss
 
-            accelerator.backward(loss_model)
-
             loss_val = loss_model.item()
-            if not torch.isnan(loss_model):
+
+            # 🛡️ Phase B NaN 保护：检测到 NaN 时跳过梯度更新，防止污染优化器状态
+            phase_b_nan = torch.isnan(loss_model).any()
+            if accelerator.num_processes > 1:
+                nan_tensor = torch.tensor(1.0 if phase_b_nan else 0.0, device=device)
+                torch.distributed.all_reduce(nan_tensor, op=torch.distributed.ReduceOp.MAX)
+                phase_b_nan = nan_tensor.item() > 0
+
+            if phase_b_nan:
+                # NaN loss: 清零梯度，跳过本次更新
+                opt_model.zero_grad()
+                if accelerator.is_local_main_process:
+                    ema_str = f"{loss_ema:.4f}" if loss_ema is not None else "N/A"
+                    progress_bar.set_description(
+                        f"Step {global_step} Loss: NaN (EMA: {ema_str}) | ⚠️ NaN skipped"
+                    )
+            else:
+                accelerator.backward(loss_model)
+
                 if loss_ema is None:
                     loss_ema = loss_val
                 else:
                     loss_ema = ema_decay * loss_ema + (1 - ema_decay) * loss_val
 
-            # 更新进度条
-            if accelerator.is_local_main_process:
-                ema_str = f"{loss_ema:.4f}" if loss_ema is not None else "N/A"
-                desc = f"Step {global_step} Loss: {loss_val:.4f} (EMA: {ema_str})"
-                if CONFIG['mode'] == 'agd':
-                    drop_rates = []
-                    for module in model.modules():
-                        if isinstance(module, AGDDropoutWrapper) and module.stats['probs'] is not None:
-                            drop_rates.append((1.0 - module.stats['probs'].mean()).item())
-                    avg_drop = sum(drop_rates) / len(drop_rates) if drop_rates else 0.0
-                    desc += f" | Cost: {last_cost_val:.4f} | Drop: {avg_drop*100:.1f}%"
-                if torch.isnan(loss_model):
-                    desc += " | ⚠️ NaN"
-                progress_bar.set_description(desc)
+                # 更新进度条
+                if accelerator.is_local_main_process:
+                    ema_str = f"{loss_ema:.4f}" if loss_ema is not None else "N/A"
+                    desc = f"Step {global_step} Loss: {loss_val:.4f} (EMA: {ema_str})"
+                    if CONFIG['mode'] == 'agd':
+                        drop_rates = []
+                        for module in model.modules():
+                            if isinstance(module, AGDDropoutWrapper) and module.stats['probs'] is not None:
+                                drop_rates.append((1.0 - module.stats['probs'].mean()).item())
+                        avg_drop = sum(drop_rates) / len(drop_rates) if drop_rates else 0.0
+                        desc += f" | Cost: {last_cost_val:.4f} | Drop: {avg_drop*100:.1f}%"
+                    progress_bar.set_description(desc)
 
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model_params, max_norm=CONFIG['max_grad_norm'])
-            opt_model.step()
-            scheduler.step()
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model_params, max_norm=CONFIG['max_grad_norm'])
+                opt_model.step()
+                scheduler.step()
 
-            # 更新 grad_ema
-            if CONFIG['mode'] == 'agd' and accelerator.sync_gradients:
-                for m in model.modules():
-                    if isinstance(m, AGDDropoutWrapper):
-                        if m.upstream_linear is not None:
-                            grad_signal = _get_grad_per_output(m.upstream_linear)
-                            if grad_signal is not None:
-                                grad_signal = grad_signal / CONFIG['grad_accum']
-                                m.update_grad_ema(grad_signal)
-
-                # 同步所有 rank 的 grad_ema
-                if accelerator.num_processes > 1:
+                # 更新 grad_ema
+                if CONFIG['mode'] == 'agd' and accelerator.sync_gradients:
                     for m in model.modules():
-                        if isinstance(m, AGDDropoutWrapper) and m._grad_ema is not None:
-                            torch.distributed.all_reduce(m.grad_ema, op=torch.distributed.ReduceOp.AVG)
+                        if isinstance(m, AGDDropoutWrapper):
+                            if m.upstream_linear is not None:
+                                grad_signal = _get_grad_per_output(m.upstream_linear)
+                                if grad_signal is not None:
+                                    grad_signal = grad_signal / CONFIG['grad_accum']
+                                    m.update_grad_ema(grad_signal)
 
-            opt_model.zero_grad()
+                    # 同步所有 rank 的 grad_ema
+                    if accelerator.num_processes > 1:
+                        for m in model.modules():
+                            if isinstance(m, AGDDropoutWrapper) and m._grad_ema is not None:
+                                torch.distributed.all_reduce(m.grad_ema, op=torch.distributed.ReduceOp.AVG)
+
+                opt_model.zero_grad()
 
         # === SwanLab 日志 (必须在 stats 清空之前) ===
         if global_step % CONFIG['logging_steps'] == 0 and accelerator.is_main_process and HAS_SWANLAB:
-            # 计算当前epoch
-            current_epoch = global_step / steps_per_epoch
-            
             log_dict = {
                 "train/loss": loss_val,
                 "train/loss_ema": loss_ema if loss_ema is not None else loss_val,
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/step": global_step,
-                "train/epoch": current_epoch,
             }
 
             if CONFIG['mode'] == 'agd':
@@ -659,12 +690,6 @@ def main():
 
         global_step += 1
         progress_bar.update(1)
-        
-        # 更新 epoch（用于进度条显示）
-        new_epoch = global_step // steps_per_epoch
-        if new_epoch > current_epoch and accelerator.is_main_process:
-            current_epoch = new_epoch
-            print(f"\n📊 Epoch {current_epoch}/{CONFIG['num_epochs']} completed")
 
         # === 评估 ===
         if global_step % CONFIG['eval_steps'] == 0:
