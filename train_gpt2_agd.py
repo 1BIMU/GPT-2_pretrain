@@ -403,9 +403,11 @@ def main():
         min_lr_ratio=min_lr_ratio
     )
 
-    # Prepare
-    model, opt_model, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, opt_model, train_loader, val_loader, scheduler
+    # Prepare (注意: scheduler 不经过 prepare，手动在 sync_gradients 时 step)
+    # 原因: accelerator.prepare(scheduler) 会自动在 optimizer.step() 时 step scheduler，
+    # 如果代码又显式调 scheduler.step()，会造成 double-stepping
+    model, opt_model, train_loader, val_loader = accelerator.prepare(
+        model, opt_model, train_loader, val_loader
     )
 
     # === Resume 逻辑 ===
@@ -444,7 +446,9 @@ def main():
     model.train()
     if accelerator.is_main_process:
         os.makedirs(CONFIG['output_dir'], exist_ok=True)
-        print(f"📊 Max steps: {CONFIG['max_steps']}")
+        total_batches = CONFIG['max_steps'] * CONFIG['grad_accum']
+        print(f"📊 Max steps: {CONFIG['max_steps']} optimizer updates")
+        print(f"   = {total_batches:,} batches (grad_accum={CONFIG['grad_accum']})")
 
     accelerator.wait_for_everyone()
 
@@ -586,6 +590,13 @@ def main():
         # ==========================================
         # Phase B: Defend / Standard Train
         # ==========================================
+        # 恢复模型参数梯度，冻结 generator（与 CLIP 训练循环对齐）
+        for p in model_params:
+            p.requires_grad = True
+        if CONFIG['mode'] == 'agd':
+            for p in gen_params:
+                p.requires_grad = False
+
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss_model = outputs.loss
@@ -631,7 +642,9 @@ def main():
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model_params, max_norm=CONFIG['max_grad_norm'])
                 opt_model.step()
-                scheduler.step()
+                # scheduler 只在实际参数更新时 step（与 grad_accum 同步）
+                if accelerator.sync_gradients:
+                    scheduler.step()
 
                 # 更新 grad_ema
                 if CONFIG['mode'] == 'agd' and accelerator.sync_gradients:
@@ -651,48 +664,51 @@ def main():
 
                 opt_model.zero_grad()
 
-        # === SwanLab 日志 (必须在 stats 清空之前) ===
-        if global_step % CONFIG['logging_steps'] == 0 and accelerator.is_main_process and HAS_SWANLAB:
-            log_dict = {
-                "train/loss": loss_val,
-                "train/loss_ema": loss_ema if loss_ema is not None else loss_val,
-                "train/learning_rate": scheduler.get_last_lr()[0],
-                "train/step": global_step,
-            }
+        # === 仅在 optimizer update（sync_gradients）时推进 global_step ===
+        # global_step 现在代表 optimizer update 次数，与 HF Trainer 一致
+        if accelerator.sync_gradients:
+            global_step += 1
+            progress_bar.update(1)
 
-            if CONFIG['mode'] == 'agd':
-                log_dict["agd/gen_loss"] = last_gen_loss
-                log_dict["agd/cost"] = last_cost_val
+            # === SwanLab 日志 (在 stats 清空之前) ===
+            if global_step % CONFIG['logging_steps'] == 0 and accelerator.is_main_process and HAS_SWANLAB:
+                log_dict = {
+                    "train/loss": loss_val,
+                    "train/loss_ema": loss_ema if loss_ema is not None else loss_val,
+                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "train/step": global_step,
+                }
 
-                # 收集各层 dropout rate (stats 尚未清空)
-                unwrapped_for_log = accelerator.unwrap_model(model)
-                layer_drop_rates = {}
-                all_rates = []
-                for m in unwrapped_for_log.modules():
-                    if isinstance(m, AGDDropoutWrapper) and m.stats.get('probs') is not None:
-                        dr = (1.0 - m.stats['probs'].mean()).item()
-                        layer_drop_rates[f"dropout/{m.name}"] = dr
-                        all_rates.append(dr)
+                if CONFIG['mode'] == 'agd':
+                    log_dict["agd/gen_loss"] = last_gen_loss
+                    log_dict["agd/cost"] = last_cost_val
 
-                log_dict.update(layer_drop_rates)
-                if all_rates:
-                    log_dict["dropout/avg_rate"] = sum(all_rates) / len(all_rates)
-                    log_dict["dropout/max_rate"] = max(all_rates)
-                    log_dict["dropout/min_rate"] = min(all_rates)
+                    # 收集各层 dropout rate (stats 尚未清空)
+                    unwrapped_for_log = accelerator.unwrap_model(model)
+                    layer_drop_rates = {}
+                    all_rates = []
+                    for m in unwrapped_for_log.modules():
+                        if isinstance(m, AGDDropoutWrapper) and m.stats.get('probs') is not None:
+                            dr = (1.0 - m.stats['probs'].mean()).item()
+                            layer_drop_rates[f"dropout/{m.name}"] = dr
+                            all_rates.append(dr)
 
-            swanlab.log(log_dict, step=global_step)
+                    log_dict.update(layer_drop_rates)
+                    if all_rates:
+                        log_dict["dropout/avg_rate"] = sum(all_rates) / len(all_rates)
+                        log_dict["dropout/max_rate"] = max(all_rates)
+                        log_dict["dropout/min_rate"] = min(all_rates)
 
-        # 清理 stats
+                swanlab.log(log_dict, step=global_step)
+
+        # 清理 stats (每个 batch 都清，释放显存)
         if CONFIG['mode'] == 'agd':
             for m in model.modules():
                 if isinstance(m, AGDDropoutWrapper):
                     m.stats = {'mask': None, 'probs': None, 'logits': None}
 
-        global_step += 1
-        progress_bar.update(1)
-
-        # === 评估 ===
-        if global_step % CONFIG['eval_steps'] == 0:
+        # === 评估 (仅 optimizer update 时) ===
+        if accelerator.sync_gradients and global_step % CONFIG['eval_steps'] == 0:
             accelerator.wait_for_everyone()
 
             # 🚨 所有 rank 都必须参与 evaluate（内部有 all_reduce）
@@ -715,8 +731,8 @@ def main():
 
             accelerator.wait_for_everyone()
 
-        # === 保存 checkpoint ===
-        if global_step % CONFIG['save_steps'] == 0:
+        # === 保存 checkpoint (仅 optimizer update 时) ===
+        if accelerator.sync_gradients and global_step % CONFIG['save_steps'] == 0:
             accelerator.wait_for_everyone()
 
             save_path = os.path.join(CONFIG['output_dir'], f"step_{global_step}")

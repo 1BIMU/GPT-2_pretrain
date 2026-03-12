@@ -263,8 +263,20 @@ class AGDDropoutWrapper(nn.Module):
                     logits = self.generator(state, self.layer_idx)
 
             logits = torch.clamp(logits, min=-10.0, max=10.0)
-            mask = self.generator.noisy_ste(logits)
             probs = torch.sigmoid(logits)
+
+            if self.phase_a:
+                # Phase A: 使用 noisy_ste 为 generator 提供随机梯度估计
+                # Phase A 已临时禁用 gradient checkpointing，噪声不会被重算
+                mask = self.generator.noisy_ste(logits)
+            else:
+                # Phase B: 使用确定性硬掩码（无随机噪声）
+                # 这对 gradient checkpointing 至关重要：
+                #   gradient checkpointing 会在反向传播时重算每个 block 的前向，
+                #   如果 mask 依赖 torch.randn_like()，重算时噪声不同 → mask 不同
+                #   → 梯度被错误的 mask 缩放 → 49 层级联放大 → 训练崩溃
+                # CLIP 不用 gradient checkpointing，所以没有此问题
+                mask = (probs > 0.5).float()
 
             self.stats['mask'] = mask
             self.stats['probs'] = probs

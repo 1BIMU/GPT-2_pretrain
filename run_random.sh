@@ -7,7 +7,8 @@ export NCCL_TIMEOUT=1800
 
 # 训练参数（与 train.py / config.py 对齐）
 MODEL_SIZE="gpt2-medium"
-MAX_STEPS=100000
+MAX_STEPS=-1              # -1 = 按 epoch 自动计算 (与基线一致)
+NUM_EPOCHS=1              # 与基线相同: 训 1 个 epoch
 BATCH_SIZE=12
 GRAD_ACCUM=40
 LR_MODEL=3e-4
@@ -47,6 +48,7 @@ accelerate launch --multi_gpu --num_processes=4 train_gpt2_agd.py \
     --model_size $MODEL_SIZE \
     --from_scratch \
     --max_steps $MAX_STEPS \
+    --num_epochs $NUM_EPOCHS \
     --batch_size $BATCH_SIZE \
     --grad_accum $GRAD_ACCUM \
     --lr_model $LR_MODEL \
